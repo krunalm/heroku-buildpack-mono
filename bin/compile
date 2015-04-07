@@ -5,79 +5,86 @@
 set -e
 
 DEPENDENCY_S3_BUCKET_PATH="http://s3.amazonaws.com/mono-dependencies"
-
-# config
-MONO_VERSION="3.0.11"
-XSP_VERSION="3.0.11"
-
-# s3 packages
-MONO_PACKAGE_URL="${DEPENDENCY_S3_BUCKET_PATH}/mono-${MONO_VERSION}.tar.gz"
-XSP_PACKAGE_URL="${DEPENDENCY_S3_BUCKET_PATH}/xsp-${XSP_VERSION}.tar.gz"
+MONO_VERSION="3.10.0"
+XSP_VERSION="8a31bc625727594d42f94173768bee5cf8afd0a4"
 
 BUILD_DIR=$1
 CACHE_DIR=$2
 
-cd ${BUILD_DIR}
+function conditional_download() {
+  DOWNLOAD_URL="$1"
+  DESTINATION="$2"
 
-# cache may not exist yet
+  if [ ! -d ${DESTINATION} ]; then
+    rm -rf ${DESTINATION}
+    mkdir -p ${DESTINATION}
+    echo "-----> Downloading ${DOWNLOAD_URL}"
+    curl ${DOWNLOAD_URL} -s | tar xz -C ${DESTINATION}
+  fi
+}
+
+LP_DIR=`cd $(dirname $0); cd ..; pwd`
+cd ${BUILD_DIR}
 mkdir -p ${CACHE_DIR}
 
-echo "-----> Bundling Mono v${MONO_VERSION}"
-MONO_CACHE_LOCATION=${CACHE_DIR}/mono-${MONO_VERSION}
-if [ ! -d "${MONO_CACHE_LOCATION}" ]; then
-  echo "Fetching Mono v${MONO_VERSION} @ ${MONO_PACKAGE_URL}"
-  mkdir -p ${MONO_CACHE_LOCATION}
-  cd ${MONO_CACHE_LOCATION}
-  curl ${MONO_PACKAGE_URL} -s | tar xz
-  cd ${BUILD_DIR}
-fi
+MONO_CACHE_LOCATION=${CACHE_DIR}/$STACK/mono-${MONO_VERSION}
+conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/mono-${MONO_VERSION}.tar.gz ${MONO_CACHE_LOCATION}
 
-echo "-----> Bundling XSP v${XSP_VERSION}"
-XSP_CACHE_LOCATION=${CACHE_DIR}/xsp-${XSP_VERSION}
-if [ ! -d "${XSP_CACHE_LOCATION}" ]; then
-  echo "Fetching ${XSP_VERSION} @ ${XSP_PACKAGE_URL}"
-  mkdir -p ${XSP_CACHE_LOCATION}
-  cd ${XSP_CACHE_LOCATION}
-  curl ${XSP_PACKAGE_URL} -s | tar xz
-  cd ${BUILD_DIR}
-
-  echo "Copying libraries to the GAC"
-  cp -r ${XSP_CACHE_LOCATION}/xsp/lib/mono/gac/* ${MONO_CACHE_LOCATION}/mono/lib/mono/gac/
-fi
-
+# Copy mono from cache to where we're building the slug
 cp -r "${MONO_CACHE_LOCATION}/mono" .
-# TODO: this is done because `ln -s` causes nuget to fail in subtle ways. Fix
-cp -r "${MONO_CACHE_LOCATION}/mono" /app/.
-
-cp -r "${XSP_CACHE_LOCATION}/xsp" .
+# Mono expects to be running out of /app
+ln -s "$BUILD_DIR/mono" /app
 
 # find a solution file
 SLN=$(find . -maxdepth 1 -iname "*.sln")
 if [ $( echo "${SLN}" | wc -l ) -gt 1 ]; then
-echo "-----> Too many *.sln files"
+  echo "-----> Too many *.sln files"
   exit 1
 fi
 
-# compile an uploaded application
-if [ "${SLN}" != "" ]; then
-  echo "-----> Compiling Mono application"
+if [ "${SLN}" == "" ]; then
+  echo "-----> No *.sln file found"
+  exit 1
+fi
 
-#  ln -s "$BUILD_DIR/mono" /app
+echo "-----> Compiling Mono application"
 
-  export PATH="/app/mono/bin:${PATH}"
-  export LD_LIBRARY_PATH="/app/mono/lib:${LD_LIBRARY_PATH}"
+export PATH="/app/mono/bin:${PATH}"
+export LD_LIBRARY_PATH="/app/mono/lib:${LD_LIBRARY_PATH}"
 
-  # Import certs to make NuGet work
-  mozroots --import --sync --quiet
-  yes | certmgr -ssl https://nuget.org
+# Add certs to trust store
+cp -r ${LP_DIR}/.config ~/.
+cp -r ${LP_DIR}/.config ${BUILD_DIR}/.
 
-  BUILD_CACHE_LOCATION=${CACHE_DIR}/build/
-  mkdir -p ${BUILD_CACHE_LOCATION}
+NUGET_EXECUTABLE_PATH=${CACHE_DIR}/nuget.exe
+if [ ! -f ${NUGET_EXECUTABLE_PATH} ]; then
+  curl -LSso ${NUGET_EXECUTABLE_PATH} http://nuget.org/nuget.exe
+fi
 
-  # Build
-  EnableNuGetPackageRestore=true xbuild /property:Configuration=Release /property:OutDir=${BUILD_CACHE_LOCATION} ${SLN}
+BUILD_CACHE_LOCATION=${CACHE_DIR}/build/
+mkdir -p ${BUILD_CACHE_LOCATION}
 
-  cp -r ${BUILD_CACHE_LOCATION}* ${BUILD_DIR}
+mono ${NUGET_EXECUTABLE_PATH} restore -NonInteractive
+xbuild /property:Configuration=Release /property:OutDir=${BUILD_CACHE_LOCATION} ${SLN}
+
+cp -r ${BUILD_CACHE_LOCATION}* ${BUILD_DIR}
+
+mkdir -p ${BUILD_DIR}/.profile.d
+cp -n ${LP_DIR}/.profile.d/* ${BUILD_DIR}/.profile.d/
+
+if [ -d "$BUILD_DIR/_PublishedWebsites/" ]; then
+  XSP_CACHE_LOCATION=${CACHE_DIR}/${STACK}/xsp-${XSP_VERSION}
+  conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/xsp-${XSP_VERSION}.tar.gz ${XSP_CACHE_LOCATION}
+  cp -r ${XSP_CACHE_LOCATION}/xsp .
+  cp -r ${XSP_CACHE_LOCATION}/xsp/lib/mono/gac/* ./mono/lib/mono/gac/
+
+  NGINX_CACHE_PATH=${CACHE_DIR}/${STACK}/nginx
+  conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/nginx.tar.gz ${NGINX_CACHE_PATH}
+
+  mkdir -p ${BUILD_DIR}/nginx
+  cp ${NGINX_CACHE_PATH}/nginx ${BUILD_DIR}/nginx/.
+  # Copy nginx configuration from buildpack dir
+  cp ${LP_DIR}/nginx/* ${BUILD_DIR}/nginx/.
 fi
 
 echo "-----> Build SUCCESS"
